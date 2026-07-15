@@ -323,6 +323,7 @@ def test_local_embedded_client_creation_is_mockable(monkeypatch):
 
     monkeypatch.setattr(importer, "_check_local_runtime", lambda: (True, ""))
     monkeypatch.setitem(__import__("sys").modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeEmbedded))
+    monkeypatch.delenv("HINDSIGHT_IDLE_TIMEOUT", raising=False)
 
     client = HindsightImportClient(
         {
