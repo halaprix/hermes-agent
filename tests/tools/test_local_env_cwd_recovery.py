@@ -6,6 +6,11 @@ otherwise raise ``FileNotFoundError`` before bash starts, wedging every
 subsequent terminal/file-tool call until the gateway restarts.
 
 Regression coverage for https://github.com/NousResearch/hermes-agent/issues/17558.
+
+Also covers #65583: a working directory that *exists* but the runtime user
+cannot enter (e.g. a ``/root`` cwd captured while running as root and replayed
+under a non-root gateway) makes ``Popen(cwd=...)`` raise ``PermissionError``
+just as fatally, so ``_resolve_safe_cwd`` must reject it too.
 """
 
 import os
@@ -14,9 +19,21 @@ import tempfile
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.environments.local import (
     LocalEnvironment,
     _resolve_safe_cwd,
+)
+
+_skip_as_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses directory permission checks, so os.access can't "
+    "simulate an unenterable dir",
+)
+_posix_only = pytest.mark.skipif(
+    os.name != "posix",
+    reason="chmod-based unenterable-dir simulation is POSIX-only",
 )
 
 
@@ -50,6 +67,82 @@ class TestResolveSafeCwd:
         sep = os.path.sep
         monkeypatch.setattr(os.path, "isdir", lambda p: p == sep)
         assert _resolve_safe_cwd("/no/such/deep/dir") == sep
+
+
+class TestResolveSafeCwdUnenterable:
+    """#65583: a cwd that exists but the user can't enter must be rejected.
+
+    ``Popen(cwd=path)`` chdir()s into *path* in the child, which needs
+    execute/search permission on the directory. A ``/root`` working dir
+    captured while running as root and replayed under a non-root gateway
+    ``exists`` (so ``os.path.isdir`` is True) but is unenterable, and Popen
+    raises ``PermissionError`` before bash starts — wedging every terminal and
+    file-tool call. ``_resolve_safe_cwd`` must treat it like a missing cwd.
+    """
+
+    @_posix_only
+    @_skip_as_root
+    def test_unenterable_dir_falls_back_to_home(self, tmp_path, monkeypatch):
+        locked = tmp_path / "root-like"
+        locked.mkdir(mode=0o000)
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        try:
+            assert os.path.isdir(str(locked))  # it exists…
+            assert not os.access(str(locked), os.X_OK)  # …but is unenterable
+            assert _resolve_safe_cwd(str(locked)) == str(home)
+        finally:
+            os.chmod(str(locked), 0o700)  # let tmp_path cleanup remove it
+
+    @_posix_only
+    @_skip_as_root
+    def test_unenterable_dir_falls_back_to_tempdir_when_home_unusable(
+        self, tmp_path, monkeypatch
+    ):
+        locked = tmp_path / "root-like"
+        locked.mkdir(mode=0o000)
+        # HOME points at another unenterable dir → must reach the tempdir floor.
+        bad_home = tmp_path / "bad-home"
+        bad_home.mkdir(mode=0o000)
+        monkeypatch.setenv("HOME", str(bad_home))
+        try:
+            assert _resolve_safe_cwd(str(locked)) == tempfile.gettempdir()
+        finally:
+            os.chmod(str(locked), 0o700)
+            os.chmod(str(bad_home), 0o700)
+
+    @_posix_only
+    @_skip_as_root
+    def test_run_bash_recovers_from_unenterable_cwd(self, tmp_path, monkeypatch, caplog):
+        locked = tmp_path / "root-like"
+        locked.mkdir(mode=0o000)
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+
+        with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
+            env = LocalEnvironment(cwd=str(locked), timeout=10)
+
+        captured: dict = {}
+        fds: list = []
+        try:
+            with patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
+                 patch("subprocess.Popen", side_effect=_make_fake_popen(captured, fds)), \
+                 patch("tools.terminal_tool._interrupt_event", _fake_interrupt()), \
+                 caplog.at_level("WARNING", logger="tools.environments.local"):
+                env.execute("echo hello")
+        finally:
+            _close_fds(fds)
+            os.chmod(str(locked), 0o700)
+
+        # Popen must have been handed an enterable directory, NOT the locked one.
+        assert captured["cwd"] == str(home)
+        assert os.access(captured["cwd"], os.X_OK)
+        assert env.cwd == str(home)
+        # The warning must name the real reason (accessibility), not "missing".
+        assert any("not accessible" in rec.message for rec in caplog.records)
+        assert not any("missing on disk" in rec.message for rec in caplog.records)
 
 
 def _fake_interrupt():

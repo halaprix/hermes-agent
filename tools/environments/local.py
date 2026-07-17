@@ -95,29 +95,67 @@ def _quote_bash_path(path: str) -> str:
     return shlex.quote(_bash_safe_path(path))
 
 
+def _cwd_is_usable(cwd: str) -> bool:
+    """True when ``cwd`` is a directory the current process can enter.
+
+    ``subprocess.Popen(cwd=...)`` chdir()s into the directory in the child,
+    which needs execute/search permission on it. A path that merely *exists*
+    isn't enough: a ``/root`` working directory captured while running as root
+    and later replayed under a non-root gateway exists (``os.path.isdir`` is
+    True) but is unenterable, and Popen raises ``PermissionError`` before bash
+    starts (#65583). ``os.access(cwd, os.X_OK)`` is the exact capability Popen
+    needs, so we gate on it — on POSIX only, since ``os.access`` execute bits
+    are not meaningful on Windows (the EACCES-on-cwd failure is POSIX-specific).
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return False
+    if _IS_WINDOWS:
+        return True
+    return os.access(cwd, os.X_OK)
+
+
 def _resolve_safe_cwd(cwd: str) -> str:
-    """Return ``cwd`` if it exists as a directory, else the nearest existing
-    ancestor.  Falls back to ``tempfile.gettempdir()`` only if walking up the
-    path can't find any existing directory (effectively never on a healthy
-    filesystem, but cheap belt-and-braces).
+    """Return ``cwd`` if the current process can use it as a working directory,
+    else a safe fallback.
+
+    Two failure modes are handled:
+
+    * **Missing** cwd — most commonly a previous tool call ``rm -rf``'d its own
+      working directory (issue #17558). Recover to the nearest *existing,
+      enterable* ancestor so we stay close to where we were.
+    * **Unenterable** cwd — the directory exists but the runtime user has no
+      search permission on it, e.g. a ``/root`` cwd captured while running as
+      root and replayed under a non-root gateway (#65583). Climbing to the
+      nearest enterable ancestor would land on ``/`` (a useless working dir),
+      so prefer the user's home — where a fresh session starts and which is
+      writable by the runtime user.
+
+    In both cases ``subprocess.Popen(..., cwd=...)`` would otherwise raise
+    (``FileNotFoundError`` / ``PermissionError``) before bash starts, wedging
+    every subsequent terminal and file-tool call until the gateway restarts.
+    Falls back to ``tempfile.gettempdir()`` when nothing else is usable.
 
     On Windows, also normalizes Git Bash / MSYS-style POSIX paths
-    (``/c/Users/x``) to native Windows form before the isdir check so a
-    perfectly valid ``pwd -P`` result from bash doesn't get rejected as
-    "missing" (see ``_msys_to_windows_path``).
-
-    Used by ``_run_bash`` to recover when the configured cwd is gone — most
-    commonly because a previous tool call deleted its own working directory
-    (issue #17558).  Without this guard, ``subprocess.Popen(..., cwd=...)``
-    raises ``FileNotFoundError`` before bash starts, wedging every subsequent
-    terminal call until the gateway restarts.
+    (``/c/Users/x``) to native Windows form before the check so a perfectly
+    valid ``pwd -P`` result from bash doesn't get rejected (see
+    ``_msys_to_windows_path``).
     """
     cwd = _msys_to_windows_path(cwd) if _IS_WINDOWS else cwd
-    if cwd and os.path.isdir(cwd):
+    if _cwd_is_usable(cwd):
         return cwd
+
+    # Unenterable-but-present (#65583): the nearest enterable ancestor is
+    # typically ``/``, a useless working dir, so prefer the user's home.
+    if cwd and os.path.isdir(cwd):
+        home = os.path.expanduser("~")
+        if home != cwd and _cwd_is_usable(home):
+            return home
+        return tempfile.gettempdir()
+
+    # Missing (#17558): walk up to the nearest existing, enterable ancestor.
     parent = os.path.dirname(cwd) if cwd else ""
     while parent:
-        if os.path.isdir(parent):
+        if _cwd_is_usable(parent):
             return parent
         next_parent = os.path.dirname(parent)
         if next_parent == parent:
@@ -1194,14 +1232,22 @@ class LocalEnvironment(BaseEnvironment):
         safe_cwd = _resolve_safe_cwd(self.cwd)
         if safe_cwd != self.cwd:
             # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
+            # (it's a benign normalization, not a recovery). Only warn when the
+            # directory is genuinely unusable — missing (#17558) or present but
+            # unenterable by the runtime user (#65583) — and name the reason so
+            # the log points at the real cause.
             normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
             if safe_cwd != normalized:
+                reason = (
+                    "not accessible to the current user"
+                    if os.path.isdir(normalized)
+                    else "missing on disk"
+                )
                 logger.warning(
-                    "LocalEnvironment cwd %r is missing on disk; "
+                    "LocalEnvironment cwd %r is %s; "
                     "falling back to %r so terminal commands keep working.",
                     self.cwd,
+                    reason,
                     safe_cwd,
                 )
             self.cwd = safe_cwd
